@@ -1,0 +1,713 @@
+"""
+Multi-Asset SMC Alert Bot — Advanced Engine (Anti-Duplication Fixed)
+Scans XAU/USD, US30, NAS100, EUR/USD concurrently using identical
+15m / 1H / 4H multi-timeframe logic.
+"""
+
+import os
+import json
+import time
+import logging
+import tempfile
+import threading
+import schedule
+import requests
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import mplfinance as mpf
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, date, timedelta
+from pathlib import Path
+from flask import Flask
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── Default timeframe stack (swing assets) ────────────────────────────────────
+INTERVAL = "15m"   
+HTF1     = "1h"    
+HTF2     = "4h"    
+
+SCAN_EVERY_MINUTES = 15   
+
+# ── Asset Universe ─────────────────────────────────────────────────────────────
+ASSETS = [
+    {
+        "symbol":      "GC=F",
+        "name":        "XAU/USD",
+        "pip_size":    0.10,
+        "min_atr":     0.50,
+        "decimals":    2,
+    },
+    {
+        "symbol":      "YM=F",
+        "name":        "US30",
+        "pip_size":    1.0,
+        "min_atr":     20.0,
+        "decimals":    0,
+    },
+    {
+        "symbol":      "NQ=F",
+        "name":        "NAS100",
+        "pip_size":    1.0,
+        "min_atr":     10.0,
+        "decimals":    0,
+    },
+    {
+        "symbol":      "EURUSD=X",
+        "name":        "EUR/USD",
+        "pip_size":    0.0001,
+        "min_atr":     0.0003,
+        "decimals":    5,
+    },
+    {
+        "symbol":      "GBPUSD=X",
+        "name":        "GBP/USD",
+        "pip_size":    0.0001,
+        "min_atr":     0.0003,
+        "decimals":    5,
+    },
+    {
+        "symbol":      "GBPJPY=X",
+        "name":        "GBP/JPY",
+        "pip_size":    0.01,
+        "min_atr":     0.05,
+        "decimals":    3,
+    },
+    {
+        "symbol":      "BTC-USD",
+        "name":        "BTC/USD",
+        "pip_size":    1.0,
+        "min_atr":     50.0,
+        "decimals":    2,
+        "interval":    "1m",
+        "htf1":        "5m",
+        "htf2":        "5m",
+        "exec_period": "2d",
+        "htf1_period": "5d",
+        "htf2_period": "5d",
+        "scan_every":  1,
+    },
+]
+
+SWING_ASSETS = [a for a in ASSETS if a.get("scan_every", SCAN_EVERY_MINUTES) == SCAN_EVERY_MINUTES]
+SCALP_ASSETS = [a for a in ASSETS if a.get("scan_every", SCAN_EVERY_MINUTES) < SCAN_EVERY_MINUTES]
+
+SL_ATR_MULT = 0.5   
+TP_ATR_MULT = 3.0   
+
+EQ_TOLERANCE_MULT = 0.4   
+SWEEP_WINDOW      = 6     
+EQ_MIN_GAP        = 4     
+
+SWING_LOOKBACK = 5
+FVG_LOOKBACK   = 40
+OB_LOOKBACK    = 20
+SWEEP_LOOKBACK = 40
+
+TRADE_LOG_FILE = Path("trades.json")
+
+_open_trades: dict[str, dict] = {}
+_last_sent_signals: dict[str, str] = {}  # Anti-duplication memory cache
+_trades_lock = threading.Lock()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+def send_telegram(message: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        log.info("Telegram: sent.")
+        return True
+    except requests.RequestException as e:
+        log.error(f"Telegram error: {e}")
+        return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA FETCHING
+# ══════════════════════════════════════════════════════════════════════════════
+def fetch_ohlcv(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+        if df is None or df.empty:
+            log.warning(f"{symbol} [{interval}]: no data returned.")
+            return None
+        df = df[["Open", "High", "Low", "Close"]].dropna()
+        log.info(f"{symbol} [{interval}]: {len(df)} candles")
+        return df
+    except Exception as e:
+        log.error(f"{symbol} [{interval}] fetch error: {e}")
+        return None
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, pc = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LAYER 1 — MULTI-TIMEFRAME BIAS
+# ══════════════════════════════════════════════════════════════════════════════
+def _bias_from_df(df: pd.DataFrame, label: str) -> str | None:
+    if df is None or len(df) < 25:
+        log.info(f"{label}: insufficient candles.")
+        return None
+
+    closes   = df["Close"]
+    ema20    = closes.ewm(span=20, adjust=False).mean()
+    price    = closes.iloc[-1]
+    ema_bias = "BUY" if price > ema20.iloc[-1] else "SELL"
+
+    highs, lows = df["High"].values, df["Low"].values
+    n = len(highs)
+    sh_px, sl_px = [], []
+    for i in range(3, n - 3):
+        if highs[i] == max(highs[i - 3: i + 4]):
+            sh_px.append(highs[i])
+        if lows[i] == min(lows[i - 3: i + 4]):
+            sl_px.append(lows[i])
+
+    if len(sh_px) >= 2 and len(sl_px) >= 2:
+        hh = sh_px[-1] > sh_px[-2];  hl = sl_px[-1] > sl_px[-2]
+        lh = sh_px[-1] < sh_px[-2];  ll = sl_px[-1] < sl_px[-2]
+        struct = "BUY" if (hh and hl) else ("SELL" if (lh and ll) else None)
+        if struct and struct != ema_bias:
+            log.info(f"{label}: EMA={ema_bias} vs structure={struct} — no bias.")
+            return None
+
+    log.info(f"{label}: {ema_bias}  price={price:.5g}  EMA={ema20.iloc[-1]:.5g}")
+    return ema_bias
+
+def get_htf_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str | None:
+    b4 = _bias_from_df(df_4h, "4H")
+    b1 = _bias_from_df(df_1h, "1H")
+    if b4 is None or b1 is None:
+        return None
+    if b4 != b1:
+        return None
+    return b4
+
+def find_swing_highs_lows(df: pd.DataFrame, strength: int = SWING_LOOKBACK):
+    highs, lows, n = df["High"].values, df["Low"].values, len(df)
+    sh_idx = sl_idx = None
+    for i in range(strength, n - 1):
+        if highs[i] == max(highs[max(0, i - strength): i + strength + 1]):
+            sh_idx = i
+        if lows[i]  == min(lows[max(0,  i - strength): i + strength + 1]):
+            sl_idx = i
+    return sh_idx, sl_idx
+
+def get_pd_zone(df: pd.DataFrame, sh_idx, sl_idx) -> str | None:
+    if sh_idx is None or sl_idx is None:
+        return None
+    swing_high = df["High"].iloc[sh_idx]
+    swing_low  = df["Low"].iloc[sl_idx]
+    if swing_high <= swing_low:
+        return None
+    mid   = (swing_high + swing_low) / 2
+    price = df["Close"].iloc[-1]
+    zone  = "discount" if price < mid else "premium"
+    return zone
+
+def detect_sweep(df: pd.DataFrame, atr_val: float) -> tuple[str | None, float | None]:
+    n = len(df)
+    if n < SWEEP_LOOKBACK + SWEEP_WINDOW + 2:
+        return None, None
+
+    tolerance = atr_val * EQ_TOLERANCE_MULT
+    ref       = df.iloc[-(SWEEP_LOOKBACK + SWEEP_WINDOW): -SWEEP_WINDOW]
+    ref_h, ref_l = ref["High"].values, ref["Low"].values
+    recent    = df.iloc[-SWEEP_WINDOW:]
+
+    eqh, eql = [], []
+    m = len(ref_h)
+    for i in range(m):
+        for j in range(i + EQ_MIN_GAP, m):
+            if abs(ref_h[i] - ref_h[j]) <= tolerance:
+                eqh.append(max(ref_h[i], ref_h[j]))
+            if abs(ref_l[i] - ref_l[j]) <= tolerance:
+                eql.append(min(ref_l[i], ref_l[j]))
+
+    if not eqh and not eql:
+        return None, None
+
+    for _, row in recent.iterrows():
+        for lvl in eqh:
+            if row["High"] > lvl and row["Close"] < lvl:
+                return "SELL", lvl
+        for lvl in eql:
+            if row["Low"] < lvl and row["Close"] > lvl:
+                return "BUY", lvl
+    return None, None
+
+def detect_structure_break(df: pd.DataFrame, sh_idx, sl_idx) -> tuple[str | None, float | None, str | None]:
+    if len(df) < 3:
+        return None, None, None
+    last, prev = df["Close"].iloc[-1], df["Close"].iloc[-2]
+
+    if sh_idx is not None:
+        sh = df["High"].iloc[sh_idx]
+        if prev <= sh < last:
+            return "BUY", sh, "CHoCH"
+    if sl_idx is not None:
+        sl = df["Low"].iloc[sl_idx]
+        if prev >= sl > last:
+            return "SELL", sl, "CHoCH"
+
+    window = df["Close"].iloc[-21:-1]
+    if len(window) >= 20:
+        if last > window.max():
+            return "BUY", window.max(), "BOS"
+        if last < window.min():
+            return "SELL", window.min(), "BOS"
+    return None, None, None
+
+def find_fvg(df: pd.DataFrame, direction: str, atr_val: float) -> dict | None:
+    price, n = df["Close"].iloc[-1], len(df)
+    for i in range(n - 1, max(2, n - FVG_LOOKBACK - 1), -1):
+        h2, l2 = df["High"].iloc[i - 2], df["Low"].iloc[i - 2]
+        hi, li = df["High"].iloc[i],     df["Low"].iloc[i]
+        if direction == "BUY" and li > h2:
+            fvg = {"low": h2, "high": li, "mid": (h2 + li) / 2}
+            if price <= fvg["high"] + atr_val:
+                return fvg
+        elif direction == "SELL" and hi < l2:
+            fvg = {"low": hi, "high": l2, "mid": (hi + l2) / 2}
+            if price >= fvg["low"] - atr_val:
+                return fvg
+    return None
+
+def find_order_block(df: pd.DataFrame, direction: str, atr_val: float) -> dict | None:
+    price, n = df["Close"].iloc[-1], len(df)
+    for i in range(n - 2, max(0, n - OB_LOOKBACK - 1), -1):
+        o, c = df["Open"].iloc[i], df["Close"].iloc[i]
+        h, l = df["High"].iloc[i], df["Low"].iloc[i]
+        if direction == "BUY"  and c < o:
+            ob = {"low": l, "high": h, "mid": (h + l) / 2}
+            if ob["low"] - atr_val <= price <= ob["high"] + atr_val:
+                return ob
+        elif direction == "SELL" and c > o:
+            ob = {"low": l, "high": h, "mid": (h + l) / 2}
+            if ob["low"] - atr_val <= price <= ob["high"] + atr_val:
+                return ob
+    return None
+
+def ob_overlaps_fvg(ob: dict, fvg: dict, atr_val: float) -> bool:
+    return not (ob["high"] < fvg["low"] - atr_val or ob["low"] > fvg["high"] + atr_val)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HIGH-CONFLUENCE SIGNAL ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+def analyse(df: pd.DataFrame, htf_bias: str | None, min_atr: float) -> dict | None:
+    atr_val = calc_atr(df).iloc[-1]
+    if pd.isna(atr_val) or atr_val < min_atr:
+        return None
+
+    price = df["Close"].iloc[-1]
+    if htf_bias is None: return None
+
+    sh_idx, sl_idx = find_swing_highs_lows(df)
+    pd_zone = get_pd_zone(df, sh_idx, sl_idx)
+    if pd_zone is None: return None
+
+    if   htf_bias == "BUY"  and pd_zone == "discount": direction = "BUY"
+    elif htf_bias == "SELL" and pd_zone == "premium":  direction = "SELL"
+    else: return None
+
+    sweep_dir, sweep_lvl = detect_sweep(df, atr_val)
+    if sweep_dir != direction: return None
+
+    struct_dir, struct_lvl, struct_type = detect_structure_break(df, sh_idx, sl_idx)
+    if struct_dir != direction: return None
+
+    fvg = find_fvg(df, direction, atr_val)
+    if fvg is None: return None
+
+    ob = find_order_block(df, direction, atr_val)
+    if ob is None or not ob_overlaps_fvg(ob, fvg, atr_val): return None
+
+    if direction == "BUY":
+        sl = ob["low"] - atr_val * SL_ATR_MULT
+        tp = (df["High"].iloc[sh_idx] if sh_idx is not None and df["High"].iloc[sh_idx] > price else price + TP_ATR_MULT * atr_val)
+        if tp <= price: tp = price + TP_ATR_MULT * atr_val
+    else:
+        sl = ob["high"] + atr_val * SL_ATR_MULT
+        tp = (df["Low"].iloc[sl_idx] if sl_idx is not None and df["Low"].iloc[sl_idx] < price else price - TP_ATR_MULT * atr_val)
+        if tp >= price: tp = price - TP_ATR_MULT * atr_val
+
+    rr = round(abs(tp - price) / abs(sl - price), 2) if abs(sl - price) > 0 else 0
+
+    return {
+        "direction":      direction,
+        "price":          price,
+        "sl":             sl,
+        "tp":             tp,
+        "rr":             rr,
+        "atr":            atr_val,
+        "ob":             ob,
+        "fvg":            fvg,
+        "sweep_level":    sweep_lvl,
+        "struct_level":   struct_lvl,
+        "struct_type":    struct_type or "CHoCH",
+        "timestamp":      datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+def fmt_price(value: float, decimals: int) -> str:
+    return f"{value:.{decimals}f}"
+
+def format_entry_alert(signal: dict, asset: dict) -> str:
+    emoji = "🟢" if signal["direction"] == "BUY" else "🔴"
+    d     = asset["decimals"]
+    return "\n".join([
+        f"{emoji} <b>{asset['name']} — {signal['direction']}</b>",
+        "",
+        f"<b>Entry:</b> {fmt_price(signal['price'], d)}",
+        f"<b>Take Profit:</b> {fmt_price(signal['tp'], d)}",
+        f"<b>Stop Loss:</b> {fmt_price(signal['sl'], d)}",
+    ])
+
+def format_tp_alert(trade: dict, asset: dict, close_price: float) -> str:
+    d = asset["decimals"]
+    return "\n".join([
+        f"✅ <b>{asset['name']} — TARGET HIT</b>",
+        "",
+        f"<b>Entry:</b> {fmt_price(trade['entry'], d)}",
+        f"<b>Take Profit:</b> {fmt_price(trade['tp'], d)}",
+        f"<b>Stop Loss:</b> {fmt_price(trade['sl'], d)}",
+    ])
+
+def format_sl_alert(trade: dict, asset: dict, close_price: float) -> str:
+    d = asset["decimals"]
+    return "\n".join([
+        f"❌ <b>{asset['name']} — STOP LOSS HIT</b>",
+        "",
+        f"<b>Entry:</b> {fmt_price(trade['entry'], d)}",
+        f"<b>Take Profit:</b> {fmt_price(trade['tp'], d)}",
+        f"<b>Stop Loss:</b> {fmt_price(trade['sl'], d)}",
+    ])
+
+def open_trade(asset: dict, signal: dict) -> None:
+    sym = asset["symbol"]
+    with _trades_lock:
+        _open_trades[sym] = {
+            "direction": signal["direction"],
+            "entry":     signal["price"],
+            "sl":        signal["sl"],
+            "tp":        signal["tp"],
+            "rr":        signal["rr"],
+            "atr":       signal["atr"],
+            "opened_at": signal["timestamp"],
+        }
+
+def close_trade(asset: dict) -> None:
+    with _trades_lock:
+        _open_trades.pop(asset["symbol"], None)
+
+_journal_lock = threading.Lock()
+
+def record_closed_trade(asset: dict, trade: dict, result: str, exit_price: float) -> None:
+    direction  = trade["direction"]
+    pip_size   = asset["pip_size"]
+    signed_pips = round((exit_price - trade["entry"]) / pip_size if direction == "BUY" else (trade["entry"] - exit_price) / pip_size)
+    now_utc = datetime.now(timezone.utc)
+    record = {
+        "date":      now_utc.strftime("%Y-%m-%d"),
+        "time":      now_utc.strftime("%H:%M UTC"),
+        "asset":     asset["name"],
+        "direction": direction,
+        "entry":     trade["entry"],
+        "exit":      exit_price,
+        "pips":      signed_pips,
+        "result":    result,
+    }
+    with _journal_lock:
+        records: list = []
+        if TRADE_LOG_FILE.exists():
+            try: records = json.loads(TRADE_LOG_FILE.read_text())
+            except: records = []
+        records.append(record)
+        TRADE_LOG_FILE.write_text(json.dumps(records, indent=2))
+
+def check_trade(asset: dict, current_price: float) -> bool:
+    with _trades_lock:
+        trade = _open_trades.get(asset["symbol"])
+    if trade is None: return False
+
+    direction, tp, sl = trade["direction"], trade["tp"], trade["sl"]
+    tp_hit = (direction == "BUY"  and current_price >= tp) or (direction == "SELL" and current_price <= tp)
+    sl_hit = (direction == "BUY"  and current_price <= sl) or (direction == "SELL" and current_price >= sl)
+
+    if tp_hit:
+        record_closed_trade(asset, trade, "TP", current_price)
+        send_telegram(format_tp_alert(trade, asset, current_price))
+        close_trade(asset)
+        return True
+    if sl_hit:
+        record_closed_trade(asset, trade, "SL", current_price)
+        send_telegram(format_sl_alert(trade, asset, current_price))
+        close_trade(asset)
+        return True
+    return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CHART RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
+_DARK_STYLE = mpf.make_mpf_style(
+    base_mpf_style="nightclouds",
+    marketcolors=mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit"),
+    gridstyle="--", gridcolor="#2d2d3a", facecolor="#131722", figcolor="#131722", y_on_right=True,
+)
+
+def render_chart(df: pd.DataFrame, signal: dict, asset: dict) -> Path:
+    direction   = signal["direction"]
+    ob          = signal["ob"]
+    fvg         = signal["fvg"]
+    tp          = signal["tp"]
+    sl          = signal["sl"]
+    price       = signal["price"]
+    atr_val     = signal["atr"]
+    sweep_lvl   = signal.get("sweep_level")
+    struct_lvl  = signal.get("struct_level")
+    struct_type = signal.get("struct_type", "CHoCH")
+    d           = asset["decimals"]
+
+    df_chart = df.tail(100).copy()
+    n        = len(df_chart)
+
+    fig, axes = mpf.plot(
+        df_chart, type="candle", style=_DARK_STYLE, returnfig=True, figsize=(14, 7), tight_layout=True,
+        title=f"\n{asset['name']}  ·  15m  ·  {direction}  @  {fmt_price(price, d)}    [{signal['timestamp']}]",
+    )
+    ax = axes[0]
+    ax.title.set_color("#e0e0e0")
+    ax.title.set_fontsize(11)
+
+    x0, x1 = -0.5, n - 0.5        
+
+    ob_clr = "#1976D2" if direction == "BUY" else "#F57C00"
+    ax.add_patch(mpatches.Rectangle((x0, ob["low"]), x1 - x0, ob["high"] - ob["low"], linewidth=1.2, edgecolor=ob_clr, facecolor=ob_clr, alpha=0.18, zorder=2))
+    
+    fvg_clr = "#00897B" if direction == "BUY" else "#C62828"
+    ax.add_patch(mpatches.Rectangle((x0, fvg["low"]), x1 - x0, fvg["high"] - fvg["low"], linewidth=1.2, edgecolor=fvg_clr, facecolor=fvg_clr, alpha=0.22, zorder=2))
+    
+    ax.axhline(tp, color="#26a69a", linewidth=1.6, linestyle="-", zorder=3)
+    ax.axhline(sl, color="#ef5350", linewidth=1.6, linestyle="-", zorder=3)
+    ax.axhline(price, color="#ffffff", linewidth=0.9, linestyle="--", alpha=0.45, zorder=3)
+
+    if struct_lvl is not None:
+        ax.axhline(struct_lvl, color="#FFD54F", linewidth=1.3, linestyle=":", zorder=3)
+
+    if sweep_lvl is not None:
+        arrow_x   = max(0, n - SWEEP_WINDOW - 2)
+        dy        = atr_val * 1.5
+        if direction == "BUY":
+            ax.annotate("", xy=(arrow_x, sweep_lvl + dy), xytext=(arrow_x, sweep_lvl - dy * 0.4), arrowprops=dict(arrowstyle="->", color="#80DEEA", lw=1.8), zorder=4)
+        else:
+            ax.annotate("", xy=(arrow_x, sweep_lvl - dy), xytext=(arrow_x, sweep_lvl + dy * 0.4), arrowprops=dict(arrowstyle="->", color="#80DEEA", lw=1.8), zorder=4)
+
+    tmp = Path(tempfile.mktemp(suffix=".png"))
+    fig.savefig(tmp, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return tmp
+
+def send_telegram_photo(photo_path: Path, caption: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID: return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    try:
+        with open(photo_path, "rb") as fh:
+            r = requests.post(url, data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}, files={"photo": fh}, timeout=30)
+        r.raise_for_status()
+        return True
+    except:
+        send_telegram(caption)
+        return False
+    finally:
+        photo_path.unlink(missing_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SINGLE-ASSET SCAN
+# ══════════════════════════════════════════════════════════════════════════════
+def scan_asset(asset: dict) -> None:
+    sym  = asset["symbol"]
+    name = asset["name"]
+
+    interval     = asset.get("interval",     INTERVAL)
+    htf1         = asset.get("htf1",         HTF1)
+    htf2         = asset.get("htf2",         HTF2)
+    exec_period  = asset.get("exec_period",  "5d")
+    htf1_period  = asset.get("htf1_period",  "10d")
+    htf2_period  = asset.get("htf2_period",  "60d")
+
+    df_exec = fetch_ohlcv(sym, interval, exec_period)
+    if df_exec is None: return
+
+    current_price = df_exec["Close"].iloc[-1]
+
+    with _trades_lock:
+        has_trade = sym in _open_trades
+    if has_trade:
+        check_trade(asset, current_price)
+        with _trades_lock:
+            still_open = sym in _open_trades
+        if still_open: return   
+
+    df_h1  = fetch_ohlcv(sym, htf1, htf1_period)
+    df_h2  = df_h1 if htf1 == htf2 else fetch_ohlcv(sym, htf2, htf2_period)
+    htf_bias = get_htf_bias(df_h1, df_h2)
+
+    signal = analyse(df_exec, htf_bias, asset["min_atr"])
+    if signal is None: return
+
+    # Anti-duplication check: Compare with last cached signal identifier
+    sig_id = f"{signal['direction']}_{df_exec.index[-1]}"
+    with _trades_lock:
+        if _last_sent_signals.get(sym) == sig_id:
+            log.info(f"[{name}] Signal {sig_id} already broadcasted. Skipping.")
+            return
+        _last_sent_signals[sym] = sig_id
+
+    caption = format_entry_alert(signal, asset)
+    try:
+        chart_path = render_chart(df_exec, signal, asset)
+        send_telegram_photo(chart_path, caption)
+    except Exception as e:
+        send_telegram(caption)
+    open_trade(asset, signal)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WEEKEND HIBERNATION + CONCURRENT SCAN RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+_was_hibernating: bool = False
+
+def is_weekend_session() -> bool:
+    now  = datetime.now(timezone.utc)
+    day  = now.weekday()          
+    mins = now.hour * 60 + now.minute
+    if day == 4 and mins >= 22 * 60:   return True   
+    if day == 5:                        return True   
+    if day == 6 and mins < 21 * 60 + 30: return True 
+    return False
+
+def run_all_scans() -> None:
+    global _was_hibernating
+    if is_weekend_session():
+        if not _was_hibernating:
+            _was_hibernating = True
+            send_telegram("🌙 <b>Weekend Hibernation</b>\n\nMarkets are closed. Pausing until Sunday 21:30 UTC.")
+        return
+
+    if _was_hibernating:
+        _was_hibernating = False
+        send_telegram("☀️ <b>Markets Reopening</b>\n\nResuming live scans across assets.")
+
+    _run_pool(SWING_ASSETS, label="swing")
+
+def _run_pool(assets: list[dict], label: str = "") -> None:
+    try:
+        with ThreadPoolExecutor(max_workers=len(assets)) as pool:
+            futures = {pool.submit(scan_asset, asset): asset for asset in assets}
+            for fut in as_completed(futures):
+                asset = futures[fut]
+                try: fut.result()
+                except Exception as e: log.error(f"[{asset['name']}] Scan error: {e}")
+    except Exception as e: log.error(f"Scan runner failed: {e}")
+
+def run_btc_scans() -> None:
+    _run_pool(SCALP_ASSETS, label="scalp")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERFORMANCE REPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+def _load_journal() -> list[dict]:
+    with _journal_lock:
+        if not TRADE_LOG_FILE.exists(): return []
+        try: return json.loads(TRADE_LOG_FILE.read_text())
+        except: return []
+
+def _stats(records: list[dict]) -> dict:
+    total  = len(records)
+    wins   = sum(1 for r in records if r["result"] == "TP")
+    losses = total - wins
+    net    = sum(r["pips"] for r in records)
+    wr     = round(wins / total * 100, 1) if total else 0.0
+    by_asset: dict[str, int] = {}
+    for r in records: by_asset[r["asset"]] = by_asset.get(r["asset"], 0) + r["pips"]
+    return {"total": total, "wins": wins, "losses": losses, "net": net, "wr": wr, "by_asset": by_asset}
+
+def send_daily_report() -> None:
+    today     = datetime.now(timezone.utc).date()
+    today_str = today.strftime("%Y-%m-%d")
+    all_rec   = _load_journal()
+    day_rec   = [r for r in all_rec if r["date"] == today_str]
+    s         = _stats(day_rec)
+    msg = f"📊 <b>DAILY REPORT</b>\n\nTotal Trades: {s['total']}\nTargets Hit: {s['wins']}\nStops Hit: {s['losses']}\nWin Rate: {s['wr']}%\nNet Pips: {s['net']}"
+    send_telegram(msg)
+
+def send_weekly_report() -> None:
+    today      = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+    all_rec    = _load_journal()
+    week_rec   = [r for r in all_rec if date.fromisoformat(r["date"]) >= week_start]
+    ws         = _stats(week_rec)
+    msg = f"📋 <b>WEEKLY REPORT</b>\n\nTotal Trades: {ws['total']}\nTargets Hit: {ws['wins']}\nStops Hit: {ws['losses']}\nWin Rate: {ws['wr']}%\nNet Pips: {ws['net']}"
+    send_telegram(msg)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEEP-ALIVE WEB SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+_flask_app = Flask(__name__)
+
+@_flask_app.route("/")
+def health():
+    return "OK", 200
+
+def start_web_server() -> None:
+    _flask_app.run(host="0.0.0.0", port=5000, use_reloader=False)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        return
+
+    threading.Thread(target=start_web_server, daemon=True).start()
+
+    run_btc_scans()
+    run_all_scans()
+
+    schedule.every(SCAN_EVERY_MINUTES).minutes.do(run_all_scans)
+    schedule.every(1).minutes.do(run_btc_scans)
+
+    schedule.every().monday.at("22:00").do(send_daily_report)
+    schedule.every().tuesday.at("22:00").do(send_daily_report)
+    schedule.every().wednesday.at("22:00").do(send_daily_report)
+    schedule.every().thursday.at("22:00").do(send_daily_report)
+    schedule.every().friday.at("22:00").do(send_weekly_report)
+
+    while True:
+        try: schedule.run_pending()
+        except Exception as e: log.error(f"Scheduler error: {e}")
+        time.sleep(15)
+
+if __name__ == "__main__":
+    main()
